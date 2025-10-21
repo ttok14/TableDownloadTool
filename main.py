@@ -2,7 +2,7 @@ import sys
 import os
 import json
 import pandas as pd
-import os;
+import subprocess
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -245,11 +245,25 @@ class DownloadWorker(QThread):
                             url = f"https://docs.google.com/spreadsheets/d/{file_id}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
                             df = pd.read_csv(url)
                             
+                            df = df.loc[:, ~df.columns.str.startswith('Unnamed')]
+                            
                             safe_file_name = "".join(c for c in file_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
-                            output_filename = f"{safe_file_name}_{sheet_name}.csv"
+                            
+                            if sheet_name == 'Table':
+                                output_filename = f"{safe_file_name}.csv"
+                            elif sheet_name == 'Schema':
+                                output_filename = f"{safe_file_name}_Schema.csv"
+                            else:
+                                output_filename = f"{safe_file_name}_{sheet_name}.csv"
+
                             output_filepath = os.path.join(self.save_path, output_filename)
 
-                            df.to_csv(output_filepath, index=False, encoding='utf-8-sig')
+                            # --- 수정된 부분: 마지막 줄바꿈 제거 ---
+                            csv_data = df.to_csv(index=False, encoding='utf-8-sig', lineterminator='\n')
+                            csv_data = csv_data.rstrip('\n')
+                            with open(output_filepath, 'w', encoding='utf-8-sig', newline='') as f:
+                                f.write(csv_data)
+
                             self.log_message.emit(f"   -> 저장 완료: {output_filepath}", self.COLOR_SUCCESS)
                             total_sheets_downloaded += 1
                         except Exception as e:
@@ -265,14 +279,17 @@ class DownloadWorker(QThread):
             return
             
         self.process_finished.emit(f"모든 작업 완료! 총 {total_sheets_downloaded}개의 시트를 다운로드했습니다.")
-
+        
         try:
-            os.startfile(self.save_path)
-            print(f"탐색기에서 경로를 열었습니다: {self.save_path}")
-        except FileNotFoundError:
-            print(f"오류: 경로를 찾을 수 없습니다: {self.save_path}")
+            if sys.platform == "win32":
+                os.startfile(self.save_path)
+            elif sys.platform == "darwin": # macOS
+                subprocess.Popen(["open", self.save_path])
+            else: # linux
+                subprocess.Popen(["xdg-open", self.save_path])
+            self.log_message.emit(f"\n저장 폴더 '{self.save_path}'를 열었습니다.", self.COLOR_SYSTEM)
         except Exception as e:
-            print(f"오류 발생: {e}")
+            self.log_message.emit(f"\n저장 폴더를 여는 데 실패했습니다: {e}", self.COLOR_WARN)
 
 
 # --- 메인 윈도우 클래스 ---

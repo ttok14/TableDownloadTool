@@ -243,9 +243,14 @@ class DownloadWorker(QThread):
                         self.log_message.emit(f"-> '{sheet_name}' 시트 다운로드 시도...", self.COLOR_INFO)
                         try:
                             url = f"https://docs.google.com/spreadsheets/d/{file_id}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
-                            df = pd.read_csv(url)
+                            # --- 수정된 부분: 모든 데이터를 문자열로 강제하고, 빈 행 제거 로직 추가 ---
+                            df = pd.read_csv(url, dtype=str, keep_default_na=False, na_values=[''])
                             
+                            # 'Unnamed'로 시작하는 열 자동 제거
                             df = df.loc[:, ~df.columns.str.startswith('Unnamed')]
+                            
+                            # 모든 셀이 비어있는 행(row) 제거
+                            df.dropna(how='all', inplace=True)
                             
                             safe_file_name = "".join(c for c in file_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
                             
@@ -258,7 +263,7 @@ class DownloadWorker(QThread):
 
                             output_filepath = os.path.join(self.save_path, output_filename)
 
-                            # --- 수정된 부분: 마지막 줄바꿈 제거 ---
+                            # 마지막 줄바꿈 제거
                             csv_data = df.to_csv(index=False, encoding='utf-8-sig', lineterminator='\n')
                             csv_data = csv_data.rstrip('\n')
                             with open(output_filepath, 'w', encoding='utf-8-sig', newline='') as f:

@@ -4,18 +4,30 @@ import json
 import pandas as pd
 import subprocess
 
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLineEdit, QLabel, QPlainTextEdit, QFileDialog, QMessageBox
-)
-from PySide6.QtCore import QThread, Signal, Slot
+try:
+    from PySide6.QtWidgets import (
+        QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+        QPushButton, QLineEdit, QLabel, QPlainTextEdit, QFileDialog, QMessageBox
+    )
+    from PySide6.QtCore import QThread, Signal, Slot, QCoreApplication
+except ImportError:
+    print("오류: PySide6 라이브러리가 설치되지 않았습니다.")
+    print("터미널에서 'pip install PySide6'를 실행해주세요.")
+    sys.exit(1)
+
 
 # Google API 관련 라이브러리
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError
+try:
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+except ImportError:
+    print("오류: Google API 라이브러리가 설치되지 않았습니다.")
+    print("pip install google-api-python-client google-auth-oauthlib google-auth-httplib2")
+    sys.exit(1)
+
 
 # --- 다크 테마 스타일시트 ---
 DARK_THEME_QSS = """
@@ -69,38 +81,52 @@ class GoogleAPIClient:
         'https://www.googleapis.com/auth/spreadsheets.readonly'
     ]
     
-    def __init__(self):
+    def __init__(self, logger_func=print):
         self.creds = None
         self.drive_service = None
         self.sheets_service = None
+        self.log = logger_func # 로깅 함수 설정
 
     def authenticate(self):
         """
         사용자 인증을 수행하고 API 서비스 객체를 생성합니다.
         성공 시 None, 실패 시 에러 메시지를 반환합니다.
         """
-        if os.path.exists('token.json'):
-            self.creds = Credentials.from_authorized_user_file('token.json', self.SCOPES)
+        token_path = os.path.join(os.path.dirname(__file__), 'token.json')
+        creds_path = os.path.join(os.path.dirname(__file__), 'credentials.json')
+
+        if os.path.exists(token_path):
+            try:
+                self.creds = Credentials.from_authorized_user_file(token_path, self.SCOPES)
+            except Exception as e:
+                self.log(f"token.json 파일 로드 오류: {e}. 파일을 삭제하고 재인증합니다.")
+                os.remove(token_path)
+                self.creds = None
         
         if not self.creds or not self.creds.valid:
             if self.creds and self.creds.expired and self.creds.refresh_token:
                 try:
+                    self.log("자격 증명 갱신 시도...")
                     self.creds.refresh(Request())
                 except Exception as e:
-                    if os.path.exists('token.json'):
-                        os.remove('token.json')
+                    self.log(f"자격 증명 갱신 실패: {e}")
+                    if os.path.exists(token_path):
+                        os.remove(token_path)
                     return self.authenticate()
             else:
-                if not os.path.exists('credentials.json'):
+                if not os.path.exists(creds_path):
                     return "인증 실패: 'credentials.json' 파일을 찾을 수 없습니다."
                 
                 try:
-                    flow = InstalledAppFlow.from_client_secrets_file('credentials.json', self.SCOPES)
-                    self.creds = flow.run_local_server(port=0)
+                    self.log("새 사용자 인증 시작 (브라우저 확인)...")
+                    flow = InstalledAppFlow.from_client_secrets_file(creds_path, self.SCOPES)
+                    # port=0: 사용 가능한 포트 자동 선택
+                    self.creds = flow.run_local_server(port=0) 
+                    self.log("새 사용자 인증 완료.")
                 except Exception as e:
                     return f"인증 과정에서 오류가 발생했습니다: {e}"
 
-            with open('token.json', 'w') as token:
+            with open(token_path, 'w') as token:
                 token.write(self.creds.to_json())
         
         try:
@@ -161,13 +187,15 @@ class GoogleAPIClient:
             sheets = sheet_metadata.get('sheets', [])
             return [sheet.get('properties', {}).get('title') for sheet in sheets]
         except HttpError as error:
-            print(f"시트 정보 가져오기 오류 (ID: {spreadsheet_id}): {error}")
+            self.log(f"시트 정보 가져오기 오류 (ID: {spreadsheet_id}): {error}")
             return None
 
 
 # --- 다운로드 작업을 수행하는 QThread 워커 ---
 class DownloadWorker(QThread):
-    log_message = Signal(str, str)  # 메시지와 색상을 함께 전달하도록 변경
+    # (메시지, 색상) 시그널
+    log_message = Signal(str, str)
+    # (최종 메시지) 시그널
     process_finished = Signal(str)
 
     # 로그 색상 정의
@@ -178,34 +206,59 @@ class DownloadWorker(QThread):
     COLOR_HIGHLIGHT = "#40c4ff"
     COLOR_SYSTEM = "#a9a9a9"
 
-    def __init__(self, root_folder_id, save_path):
+    # [수정] is_headless 플래그 추가
+    def __init__(self, root_folder_id, save_path, is_headless=False):
         super().__init__()
         self.root_folder_id = root_folder_id
         self.save_path = save_path
-        self.g_client = GoogleAPIClient()
+        self.is_headless = is_headless # [수정] 헤드리스 모드 여부 저장
+        
+        # 헤드리스 모드일 때는 print로, GUI 모드일 때는 log_message 시그널로 로그 출력
+        logger_func = self.log_to_console if is_headless else self.log_to_gui
+        self.g_client = GoogleAPIClient(logger_func=logger_func)
+
+    def log_to_gui(self, message, color=COLOR_INFO):
+        # GUI 모드용 로거
+        self.log_message.emit(message, color)
+
+    def log_to_console(self, message, color=None):
+        # 헤드리스 모드용 로거 (C#이 수집할 수 있도록 print 사용)
+        print(message)
 
     def clear_save_directory(self):
-        self.log_message.emit(f"'{self.save_path}' 폴더의 기존 파일들을 삭제합니다...", self.COLOR_SYSTEM)
+        self.log(f"'{self.save_path}' 폴더의 기존 파일들을 삭제합니다...", self.COLOR_SYSTEM)
         try:
             for filename in os.listdir(self.save_path):
                 file_path = os.path.join(self.save_path, filename)
                 if os.path.isfile(file_path):
                     os.remove(file_path)
-            self.log_message.emit("폴더 정리 완료.", self.COLOR_SYSTEM)
+            self.log("폴더 정리 완료.", self.COLOR_SYSTEM)
         except Exception as e:
-            self.log_message.emit(f"폴더 정리 중 오류 발생: {e}", self.COLOR_ERROR)
+            self.log(f"폴더 정리 중 오류 발생: {e}", self.COLOR_ERROR)
 
     def run(self):
-        self.log_message.emit("Google API 인증을 시작합니다...", self.COLOR_INFO)
+        # QThread.run()은 self.log()를 직접 호출해야 함
+        self.log = self.log_to_console if self.is_headless else self.log_to_gui
+        
+        self.log("Google API 인증을 시작합니다...", self.COLOR_INFO)
         auth_error = self.g_client.authenticate()
         if auth_error:
             self.process_finished.emit(f"인증 실패: {auth_error}")
             return
-        self.log_message.emit("인증 성공.", self.COLOR_SUCCESS)
+        self.log("인증 성공.", self.COLOR_SUCCESS)
+
+        # save_path가 없으면 생성
+        try:
+            if not os.path.exists(self.save_path):
+                os.makedirs(self.save_path)
+                self.log(f"'{self.save_path}' 폴더를 생성했습니다.", self.COLOR_SYSTEM)
+        except Exception as e:
+            self.process_finished.emit(f"저장 폴더 생성 실패: {e}")
+            return
 
         self.clear_save_directory()
 
-        self.log_message.emit(f"\n루트 폴더({self.root_folder_id})에서 스프레드시트 파일을 검색합니다...", self.COLOR_INFO)
+        self.log(f"\n루트 폴더({self.root_folder_id})에서 스프레드시트 파일을 검색합니다...", self.COLOR_INFO)
         
         total_sheets_downloaded = 0
         
@@ -214,7 +267,7 @@ class DownloadWorker(QThread):
             file_generator = self.g_client.get_spreadsheets_recursively(self.root_folder_id)
             for result in file_generator:
                 if result['type'] == 'log':
-                    self.log_message.emit(result['data'], self.COLOR_ERROR)
+                    self.log(result['data'], self.COLOR_ERROR)
                 elif result['type'] == 'files':
                     all_files.extend(result['data'])
 
@@ -223,15 +276,15 @@ class DownloadWorker(QThread):
                 return
 
             total_files = len(all_files)
-            self.log_message.emit(f"총 {total_files}개의 스프레드시트 파일을 찾았습니다.", self.COLOR_INFO)
+            self.log(f"총 {total_files}개의 스프레드시트 파일을 찾았습니다.", self.COLOR_INFO)
 
             for i, file in enumerate(all_files):
                 file_id, file_name = file['id'], file['name']
-                self.log_message.emit(f"\n[{i+1}/{total_files}] 처리 중: '{file_name}'", self.COLOR_HIGHLIGHT)
+                self.log(f"\n[{i+1}/{total_files}] 처리 중: '{file_name}'", self.COLOR_HIGHLIGHT)
 
                 all_sheet_names = self.g_client.get_sheet_info(file_id)
                 if all_sheet_names is None:
-                    self.log_message.emit(f"-> '{file_name}' 파일의 시트 정보를 가져올 수 없습니다. 건너뜁니다.", self.COLOR_WARN)
+                    self.log(f"-> '{file_name}' 파일의 시트 정보를 가져올 수 없습니다. 건너뜁니다.", self.COLOR_WARN)
                     continue
 
                 sheets_to_process = ['Table', 'Schema']
@@ -240,18 +293,17 @@ class DownloadWorker(QThread):
                 for sheet_name in sheets_to_process:
                     if sheet_name in all_sheet_names:
                         found_sheets = True
-                        self.log_message.emit(f"-> '{sheet_name}' 시트 다운로드 시도...", self.COLOR_INFO)
+                        self.log(f"-> '{sheet_name}' 시트 다운로드 시도...", self.COLOR_INFO)
                         try:
+                            # gviz tq를 사용하여 CSV로 바로 받기
                             url = f"https://docs.google.com/spreadsheets/d/{file_id}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
-                            # --- 수정된 부분: 모든 데이터를 문자열로 강제하고, 빈 행 제거 로직 추가 ---
+                            
                             df = pd.read_csv(url, dtype=str, keep_default_na=False, na_values=[''])
                             
-                            # 'Unnamed'로 시작하는 열 자동 제거
                             df = df.loc[:, ~df.columns.str.startswith('Unnamed')]
-                            
-                            # 모든 셀이 비어있는 행(row) 제거
                             df.dropna(how='all', inplace=True)
                             
+                            # 파일 이름에서 유효하지 않은 문자 제거
                             safe_file_name = "".join(c for c in file_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
                             
                             if sheet_name == 'Table':
@@ -263,21 +315,22 @@ class DownloadWorker(QThread):
 
                             output_filepath = os.path.join(self.save_path, output_filename)
 
-                            # 마지막 줄바꿈 제거
+                            # UTF-8 with BOM (Byte Order Mark)
                             csv_data = df.to_csv(index=False, encoding='utf-8-sig', lineterminator='\n')
                             csv_data = csv_data.rstrip('\n')
+                            
                             with open(output_filepath, 'w', encoding='utf-8-sig', newline='') as f:
                                 f.write(csv_data)
 
-                            self.log_message.emit(f"   -> 저장 완료: {output_filepath}", self.COLOR_SUCCESS)
+                            self.log(f"   -> 저장 완료: {output_filepath}", self.COLOR_SUCCESS)
                             total_sheets_downloaded += 1
                         except Exception as e:
-                            self.log_message.emit(f"   -> 다운로드 실패: {sheet_name} (파일: {file_name})", self.COLOR_ERROR)
-                            self.log_message.emit(f"   -> 오류: {e}", self.COLOR_ERROR)
-                            self.log_message.emit("   -> 시트 이름 컨벤션이나 시트 내용을 확인해주세요.", self.COLOR_ERROR)
+                            self.log(f"   -> 다운로드 실패: {sheet_name} (파일: {file_name})", self.COLOR_ERROR)
+                            self.log(f"   -> 오류: {e}", self.COLOR_ERROR)
+                            self.log("   -> 시트 이름 컨벤션이나 시트 내용을 확인해주세요.", self.COLOR_ERROR)
                 
                 if not found_sheets:
-                    self.log_message.emit(f"-> '{file_name}' 파일에 'Table' 또는 'Schema' 시트를 찾을 수 없습니다. (발견된 시트: {all_sheet_names})", self.COLOR_WARN)
+                    self.log(f"-> '{file_name}' 파일에 'Table' 또는 'Schema' 시트를 찾을 수 없습니다. (발견된 시트: {all_sheet_names})", self.COLOR_WARN)
 
         except Exception as e:
             self.process_finished.emit(f"작업 중 심각한 오류 발생: {e}")
@@ -285,19 +338,21 @@ class DownloadWorker(QThread):
             
         self.process_finished.emit(f"모든 작업 완료! 총 {total_sheets_downloaded}개의 시트를 다운로드했습니다.")
         
-        try:
-            if sys.platform == "win32":
-                os.startfile(self.save_path)
-            elif sys.platform == "darwin": # macOS
-                subprocess.Popen(["open", self.save_path])
-            else: # linux
-                subprocess.Popen(["xdg-open", self.save_path])
-            self.log_message.emit(f"\n저장 폴더 '{self.save_path}'를 열었습니다.", self.COLOR_SYSTEM)
-        except Exception as e:
-            self.log_message.emit(f"\n저장 폴더를 여는 데 실패했습니다: {e}", self.COLOR_WARN)
+        # [수정] 헤드리스 모드(C#에서 실행)가 아닐 때만 폴더를 엽니다.
+        if not self.is_headless:
+            try:
+                if sys.platform == "win32":
+                    os.startfile(self.save_path)
+                elif sys.platform == "darwin": # macOS
+                    subprocess.Popen(["open", self.save_path])
+                else: # linux
+                    subprocess.Popen(["xdg-open", self.save_path])
+                self.log(f"\n저장 폴더 '{self.save_path}'를 열었습니다.", self.COLOR_SYSTEM)
+            except Exception as e:
+                self.log(f"\n저장 폴더를 여는 데 실패했습니다: {e}", self.COLOR_WARN)
 
 
-# --- 메인 윈도우 클래스 ---
+# --- 메인 윈도우 클래스 (GUI 모드) ---
 class MainWindow(QMainWindow):
     CONFIG_FILE = "config.json"
 
@@ -350,10 +405,15 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.load_settings()
 
+    def get_config_path(self):
+        # config.json을 .py 파일과 동일한 디렉터리에 저장
+        return os.path.join(os.path.dirname(__file__), self.CONFIG_FILE)
+
     def load_settings(self):
+        config_path = self.get_config_path()
         try:
-            if os.path.exists(self.CONFIG_FILE):
-                with open(self.CONFIG_FILE, 'r') as f:
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
                     config = json.load(f)
                     self.folder_id_input.setText(config.get("folder_id", ""))
                     self.save_path_input.setText(config.get("save_path", ""))
@@ -365,8 +425,9 @@ class MainWindow(QMainWindow):
             "folder_id": self.folder_id_input.text(),
             "save_path": self.save_path_input.text()
         }
+        config_path = self.get_config_path()
         try:
-            with open(self.CONFIG_FILE, 'w') as f:
+            with open(config_path, 'w') as f:
                 json.dump(config, f, indent=4)
         except IOError as e:
             print(f"설정 파일 저장 오류: {e}")
@@ -395,7 +456,8 @@ class MainWindow(QMainWindow):
         
         self.save_settings()
 
-        self.worker = DownloadWorker(root_folder_id, save_path)
+        # [수정] GUI 모드이므로 is_headless=False 전달
+        self.worker = DownloadWorker(root_folder_id, save_path, is_headless=False)
         self.worker.log_message.connect(self.append_log)
         self.worker.process_finished.connect(self.on_finished)
         self.worker.start()
@@ -420,10 +482,64 @@ class MainWindow(QMainWindow):
         self.save_settings()
         event.accept()
 
-if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    app.setStyleSheet(DARK_THEME_QSS)
-    window = MainWindow()
-    window.show()
+# --- [신규] 헤드리스 모드(C# 실행) 로직 ---
+
+@Slot(str)
+def on_headless_finished(message):
+    """헤드리스 모드 작업 완료 시 호출될 슬롯"""
+    print(message) # C#이 수집할 수 있도록 최종 메시지 출력
+    if "실패" in message or "오류" in message:
+        QCoreApplication.exit(1) # 오류 코드로 종료
+    else:
+        QCoreApplication.exit(0) # 성공 코드로 종료
+
+def run_headless():
+    """GUI 없이 백그라운드에서 다운로드를 실행합니다."""
+    # QCoreApplication: GUI가 없는 애플리케이션 이벤트 루프
+    app = QCoreApplication(sys.argv)
+    
+    config_path = os.path.join(os.path.dirname(__file__), "config.json")
+    
+    if not os.path.exists(config_path):
+        print("오류: config.json 파일을 찾을 수 없습니다. (C# 스크립트가 생성해야 함)")
+        sys.exit(1)
+        
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+    except Exception as e:
+        print(f"오류: config.json 파일 읽기 실패: {e}")
+        sys.exit(1)
+
+    folder_id = config.get("folder_id")
+    save_path = config.get("save_path")
+
+    if not folder_id or not save_path:
+        print("오류: config.json에 folder_id 또는 save_path가 비어있습니다.")
+        sys.exit(1)
+
+    # [수정] 헤드리스 모드이므로 is_headless=True 전달
+    worker = DownloadWorker(folder_id, save_path, is_headless=True)
+    
+    # 작업 완료 시그널을 app.exit에 연결
+    worker.process_finished.connect(on_headless_finished)
+    
+    # 작업 시작
+    worker.start()
+    
+    # 이벤트 루프 실행 (작업이 끝날 때까지 대기)
     sys.exit(app.exec())
+
+
+if __name__ == '__main__':
+    # C# 스크립트에서 "--run" 인자를 주면 헤드리스 모드로 실행
+    if '--run' in sys.argv:
+        run_headless()
+    else:
+        # 인자가 없으면 (일반 실행) GUI 모드로 실행
+        app = QApplication(sys.argv)
+        app.setStyleSheet(DARK_THEME_QSS)
+        window = MainWindow()
+        window.show()
+        sys.exit(app.exec())
 

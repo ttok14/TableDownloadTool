@@ -190,6 +190,18 @@ class GoogleAPIClient:
             self.log(f"시트 정보 가져오기 오류 (ID: {spreadsheet_id}): {error}")
             return None
 
+    def get_sheet_values(self, spreadsheet_id, sheet_name):
+        try:
+            result = self.sheets_service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=sheet_name,
+                valueRenderOption='FORMATTED_VALUE'
+            ).execute()
+            return result.get('values', [])
+        except HttpError as error:
+            self.log(f"데이터 가져오기 오류 (ID: {spreadsheet_id}, 시트: {sheet_name}): {error}")
+            return None
+
 
 # --- 다운로드 작업을 수행하는 QThread 워커 ---
 class DownloadWorker(QThread):
@@ -295,13 +307,30 @@ class DownloadWorker(QThread):
                         found_sheets = True
                         self.log(f"-> '{sheet_name}' 시트 다운로드 시도...", self.COLOR_INFO)
                         try:
-                            # gviz tq를 사용하여 CSV로 바로 받기
-                            url = f"https://docs.google.com/spreadsheets/d/{file_id}/gviz/tq?tqx=out:csv&sheet={sheet_name}"
+                            data_rows = self.g_client.get_sheet_values(file_id, sheet_name)
                             
-                            df = pd.read_csv(url, dtype=str, keep_default_na=False, na_values=[''])
+                            if not data_rows:
+                                self.log(f"   -> 데이터가 비어있습니다: {sheet_name}", self.COLOR_WARN)
+                                continue
+
+                            header = data_rows[0]
+                            raw_values = data_rows[1:] if len(data_rows) > 1 else []
                             
-                            df = df.loc[:, ~df.columns.str.startswith('Unnamed')]
-                            df.dropna(how='all', inplace=True)
+                            # [문제 수정] 데이터 행의 길이를 헤더 길이와 강제로 일치시키는 로직 추가
+                            # Google Sheets API는 뒤쪽 빈 컬럼을 생략하므로, 이를 빈 문자열로 채워줍니다.
+                            values = []
+                            expected_len = len(header)
+                            for row in raw_values:
+                                if len(row) < expected_len:
+                                    # 부족한 만큼 빈 문자열 추가
+                                    row += [''] * (expected_len - len(row))
+                                elif len(row) > expected_len:
+                                    # 혹시라도 더 길면 자름
+                                    row = row[:expected_len]
+                                values.append(row)
+
+                            df = pd.DataFrame(values, columns=header)
+                            df.fillna('', inplace=True)
                             
                             # 파일 이름에서 유효하지 않은 문자 제거
                             safe_file_name = "".join(c for c in file_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
@@ -542,4 +571,3 @@ if __name__ == '__main__':
         window = MainWindow()
         window.show()
         sys.exit(app.exec())
-
